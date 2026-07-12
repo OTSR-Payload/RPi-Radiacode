@@ -1,0 +1,367 @@
+import os
+import time
+import csv
+import threading
+import numpy as np
+import matplotlib.pyplot as plt
+
+from radiacode import RadiaCode, RealTimeData
+
+import board
+import busio
+import adafruit_adxl34x
+import adafruit_bmp3xx
+
+# ================= CONFIG =================
+SAMPLE_INTERVAL     = 1      # seconds per spectrum sample while recording
+DOSE_POLL_INTERVAL  = 1      # seconds between dose rate / altitude polls
+IDLE_POLL_INTERVAL  = 0.1    # seconds between sensor polls while idle (pre-launch)
+
+G_FORCE_THRESHOLD_G = 3.0    # detector turns ON if |accel| exceeds this (g)
+ALTITUDE_TRIGGER_FT = 1000   # ...OR detector turns ON if AGL altitude exceeds this
+ALTITUDE_LAND_FT    = 1000   # detector turns OFF once AGL altitude drops below this...
+MAX_RECORD_SEC      = 180    # ...OR after this many seconds, whichever comes first
+
+ENERGY_MAX          = 2500   # keV upper limit for final spectrum plot
+OUTPUT_DIR          = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_FILE         = os.path.join(OUTPUT_DIR, "launch_spectrum.csv")
+DOSE_FILE           = os.path.join(OUTPUT_DIR, "dose_rate.csv")
+
+G_TO_MS2 = 9.80665
+M_TO_FT  = 3.28084
+# ==========================================
+
+
+def chan_to_energy(chan, a0, a1, a2):
+    """Convert channel number to energy (keV) using Radiacode calibration coefficients."""
+    return a0 + a1 * chan + a2 * chan**2
+
+
+def get_energies(n_channels, a0, a1, a2):
+    """Return energy array for n_channels channels."""
+    channels = np.arange(n_channels) + 0.5
+    return chan_to_energy(channels, a0, a1, a2)
+
+
+def write_spectrum_csv(filename, energies, counts):
+    """Write an energy/counts spectrum to a CSV file."""
+    with open(filename, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Energy_keV", "Counts"])
+        writer.writerows(zip(energies, counts.astype(int)))
+
+
+def reset_and_verify_spectrum(rc, lock, retries=5, delay=0.3):
+    """
+    Reset the onboard spectrum accumulator and verify it actually cleared.
+    spectrum_reset() can be asynchronous on some firmware/USB stacks, so
+    reading spectrum() immediately afterward can still return the old,
+    pre-reset histogram. Retry until the total count is (near) zero.
+    """
+    for attempt in range(1, retries + 1):
+        with lock:
+            rc.spectrum_reset()
+        time.sleep(delay)
+        with lock:
+            counts = np.asarray(rc.spectrum().counts, dtype=np.int64)
+        total = int(counts.sum())
+        if total == 0:
+            return counts
+        print(f"  [reset] attempt {attempt}: spectrum still shows {total} counts, retrying...")
+
+    print(f"  [reset] WARNING: spectrum did not clear after {retries} attempts "
+          f"({total} counts remain). Proceeding anyway.")
+    return counts
+
+
+# ---------------- Sensor helpers (ADXL345 + BMP390) ----------------
+
+def init_sensors():
+    """
+    Initialize the ADXL345 accelerometer and BMP390 altimeter over I2C, and
+    calibrate the altimeter's zero point to the current (ground) pressure so
+    that .altitude reads approximate altitude-above-ground-level from here on.
+    """
+    i2c = busio.I2C(board.SCL, board.SDA)
+
+    accel = adafruit_adxl34x.ADXL345(i2c)
+    accel.range = adafruit_adxl34x.Range.RANGE_16_G  # rockets can pull several g's
+
+    baro = adafruit_bmp3xx.BMP3XX_I2C(i2c)
+    baro.pressure_oversampling = 8
+    baro.temperature_oversampling = 2
+
+    print("Calibrating altimeter to ground level...")
+    readings = []
+    for _ in range(20):
+        readings.append(baro.pressure)
+        time.sleep(0.05)
+    baro.sea_level_pressure = sum(readings) / len(readings)
+    print(f"  Ground pressure reference set: {baro.sea_level_pressure:.2f} hPa")
+
+    return accel, baro
+
+
+def read_g_force(accel):
+    """Return the magnitude of the acceleration vector in g's."""
+    ax, ay, az = accel.acceleration  # m/s^2
+    return (ax**2 + ay**2 + az**2) ** 0.5 / G_TO_MS2
+
+
+def read_altitude_ft(baro):
+    """
+    Return altitude above ground level in feet, based on the ground-pressure
+    calibration performed in init_sensors(). This is approximate (assumes a
+    standard atmosphere and a fixed reference pressure) but is sufficient for
+    the launch/landing trigger logic here.
+    """
+    return baro.altitude * M_TO_FT
+
+
+def wait_for_launch(accel, baro):
+    """
+    Block until the launch trigger condition is met: G-force > threshold OR
+    altitude AGL > threshold. Mirrors the "Detector OFF -> monitor sensors
+    (idle)" branch of the flowchart.
+    """
+    print(f"\nDetector OFF. Monitoring sensors for launch "
+          f"(G-force > {G_FORCE_THRESHOLD_G} g OR altitude > {ALTITUDE_TRIGGER_FT} ft)...")
+    while True:
+        g = read_g_force(accel)
+        alt = read_altitude_ft(baro)
+        if g > G_FORCE_THRESHOLD_G or alt > ALTITUDE_TRIGGER_FT:
+            print(f"  Trigger detected: G-force={g:.2f}g, Altitude={alt:.0f}ft")
+            return
+        time.sleep(IDLE_POLL_INTERVAL)
+
+
+def dose_rate_thread(rc, lock, baro, sensor_lock, shared_state, start_time, stop_event, dose_records):
+    """
+    Background thread: drains data_buf() and polls altitude every
+    DOSE_POLL_INTERVAL seconds. Updates shared_state['altitude_ft'] so the
+    main thread can check the landing/stop condition without a second,
+    independent I2C poll.
+    """
+    while not stop_event.is_set():
+        time.sleep(DOSE_POLL_INTERVAL)
+        t = round(time.time() - start_time, 2)
+
+        with sensor_lock:
+            alt = read_altitude_ft(baro)
+        shared_state['altitude_ft'] = alt
+
+        try:
+            with lock:
+                records = rc.data_buf()
+            for record in records:
+                if isinstance(record, RealTimeData):
+                    dose_records.append((
+                        t,
+                        round(record.dose_rate * 1e6, 4),   # Sv/s -> µSv/h
+                        round(record.count_rate, 4),
+                        round(alt, 1),
+                    ))
+        except Exception as e:
+            print(f"[dose thread] {e}")
+
+
+# ---------------- Plotting ----------------
+
+def plot_dose_rate(dose_file):
+    """Plot dose rate and count rate vs time."""
+    times, dose_rates, count_rates = [], [], []
+    with open(dose_file, newline="") as f:
+        for row in csv.DictReader(f):
+            times.append(float(row["Time_s"]))
+            dose_rates.append(float(row["DoseRate_uSv_h"]))
+            count_rates.append(float(row["CountRate_cps"]))
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+
+    ax1.plot(times, dose_rates, color="crimson", linewidth=1.2)
+    ax1.set_ylabel("Dose Rate (µSv/h)", fontsize=11)
+    ax1.set_title("Dose Rate vs Time", fontsize=13)
+    ax1.grid(True, alpha=0.3)
+
+    ax2.plot(times, count_rates, color="steelblue", linewidth=1.2)
+    ax2.set_ylabel("Count Rate (cps)", fontsize=11)
+    ax2.set_xlabel("Time (s)", fontsize=11)
+    ax2.set_title("Count Rate vs Time", fontsize=13)
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    out = os.path.join(os.path.dirname(dose_file), "dose_rate.png")
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"Dose rate plot saved to {out}")
+    plt.show()
+
+
+def plot_dose_vs_altitude(dose_file):
+    """
+    Plot dose rate against altitude, colored by elapsed time so the
+    ascent/descent trajectory (and any hysteresis between the two legs)
+    is visible.
+    """
+    times, dose_rates, altitudes = [], [], []
+    with open(dose_file, newline="") as f:
+        for row in csv.DictReader(f):
+            times.append(float(row["Time_s"]))
+            dose_rates.append(float(row["DoseRate_uSv_h"]))
+            altitudes.append(float(row["Altitude_ft"]))
+
+    times = np.array(times)
+    dose_rates = np.array(dose_rates)
+    altitudes = np.array(altitudes)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(altitudes, dose_rates, color="gray", alpha=0.3, linewidth=0.8, zorder=1)
+    sc = ax.scatter(altitudes, dose_rates, c=times, cmap="plasma", s=22, zorder=2)
+
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label("Time (s)", fontsize=11)
+
+    ax.set_xlabel("Altitude AGL (ft)", fontsize=12)
+    ax.set_ylabel("Dose Rate (µSv/h)", fontsize=12)
+    ax.set_title("Dose Rate vs Altitude", fontsize=13)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    out = os.path.join(os.path.dirname(dose_file), "dose_vs_altitude.png")
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"Dose vs altitude plot saved to {out}")
+    plt.show()
+
+
+def plot_final_spectrum(output_file):
+    """Plot the final integrated spectrum."""
+    energies, counts = [], []
+    with open(output_file, newline="") as f:
+        for row in csv.DictReader(f):
+            energies.append(float(row["Energy_keV"]))
+            counts.append(int(row["Counts"]))
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(np.array(energies), np.array(counts), linewidth=0.8, color="steelblue")
+    ax.set_xlabel("Energy (keV)", fontsize=12)
+    ax.set_ylabel("Counts", fontsize=12)
+    ax.set_title("Integrated Spectrum", fontsize=13)
+    ax.set_xlim(0, ENERGY_MAX)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    out = os.path.join(os.path.dirname(output_file), "integrated_spectrum.png")
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"Integrated spectrum saved to {out}")
+    plt.show()
+
+
+def main():
+    print("Initializing sensors (ADXL345 + BMP390)...")
+    accel, baro = init_sensors()
+
+    print("Connecting to Radiacode...")
+    rc = RadiaCode()
+    print(f"Device:    {rc.serial_number()}")
+    print(f"Firmware:  {rc.fw_version()}")
+
+    a0, a1, a2 = rc.energy_calib()
+
+    lock = threading.Lock()         # guards RadiaCode USB access
+    sensor_lock = threading.Lock()  # guards I2C sensor access
+
+    # ---- Detector OFF / idle monitoring ----
+    rc.set_device_on(False)
+    wait_for_launch(accel, baro)
+
+    # ---- Turn detector ON, start recording, start 3-min timer ----
+    rc.set_device_on(True)
+    print("Resetting spectrum accumulator...")
+    reset_and_verify_spectrum(rc, lock)
+
+    with lock:
+        prev_counts = np.asarray(rc.spectrum().counts, dtype=np.int64)
+
+    print(f"Recording started. Will stop when altitude < {ALTITUDE_LAND_FT}ft "
+          f"or after {MAX_RECORD_SEC}s, whichever comes first.\n")
+
+    start_time = time.time()
+    dose_records = []
+    stop_event = threading.Event()
+    shared_state = {"altitude_ft": None}
+
+    dt = threading.Thread(
+        target=dose_rate_thread,
+        args=(rc, lock, baro, sensor_lock, shared_state, start_time, stop_event, dose_records),
+        daemon=True,
+    )
+    dt.start()
+
+    sample_num = 0
+
+    while True:
+        elapsed = time.time() - start_time
+        alt = shared_state.get("altitude_ft")
+
+        # Note: if the trigger fired on G-force alone before altitude climbed
+        # past ALTITUDE_LAND_FT, this condition could in principle be true on
+        # the very first pass. In practice the ascent clears 1000ft well
+        # within the first sample interval, but this is worth keeping in mind
+        # if you see unexpectedly short recordings on the pad.
+        if (alt is not None and alt < ALTITUDE_LAND_FT) or elapsed >= MAX_RECORD_SEC:
+            break
+
+        time.sleep(SAMPLE_INTERVAL)
+
+        with lock:
+            current_counts = np.asarray(rc.spectrum().counts, dtype=np.int64)
+
+        sample_counts = np.clip(current_counts - prev_counts, 0, None)
+        energies = get_energies(len(sample_counts), a0, a1, a2)
+
+        sample_num += 1
+        sec = int(elapsed)
+        filename = os.path.join(OUTPUT_DIR, f"spectrum_sample{sample_num}_sec{sec}.csv")
+        write_spectrum_csv(filename, energies, sample_counts)
+        alt_str = f"{alt:.0f}ft" if alt is not None else "—"
+        print(f"Sample {sample_num} recorded at t={sec}s (altitude={alt_str})")
+
+        prev_counts = current_counts.copy()
+
+    stop_event.set()
+    dt.join(timeout=2)
+
+    print("\nLanding/timeout condition met. Saving dose rate data...")
+
+    with open(DOSE_FILE, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Time_s", "DoseRate_uSv_h", "CountRate_cps", "Altitude_ft"])
+        writer.writerows(dose_records)
+    print(f"Dose rate data saved to {DOSE_FILE}  ({len(dose_records)} records)")
+
+    # Grab the final spectrum and power the device off IMMEDIATELY after
+    # measurement — before any plotting happens. matplotlib's plt.show()
+    # blocks until each window is closed, so we don't want the Radiacode
+    # sitting powered on at the pad waiting for someone to close plots.
+    with lock:
+        final_counts = np.asarray(rc.spectrum().counts)
+    energies_final = get_energies(len(final_counts), a0, a1, a2)
+    write_spectrum_csv(OUTPUT_FILE, energies_final, final_counts)
+    print(f"Final spectrum saved to {OUTPUT_FILE}")
+
+    # Reset the onboard spectrum accumulator now that we've saved everything
+    # we need, so the next run's baseline starts from zero.
+    print("Resetting spectrum accumulator for next run...")
+    reset_and_verify_spectrum(rc, lock)
+
+    rc.set_device_on(False)
+    print("Detector OFF.")
+
+    print("Generating plots...\n")
+
+    plot_dose_rate(DOSE_FILE)
+    plot_dose_vs_altitude(DOSE_FILE)
+    plot_final_spectrum(OUTPUT_FILE)
+
+
+if __name__ == "__main__":
+    main()
